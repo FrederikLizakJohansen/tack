@@ -1,0 +1,544 @@
+use std::{path::PathBuf, time::Duration};
+
+use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+use crate::{
+    anim::Animations,
+    model::{Project, TaskStatus},
+    storage,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Groups,
+    Composer,
+    Tasks,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Normal,
+    CreatingGroup,
+    ConfirmClearClosed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskMotion {
+    Added,
+    Closed,
+    Reopened,
+}
+
+pub struct App {
+    pub project: Project,
+    pub project_path: PathBuf,
+    pub focus: Pane,
+    pub mode: Mode,
+    pub active_group: usize,
+    pub selected_group: usize,
+    pub selected_task: usize,
+    pub composer: String,
+    pub composer_cursor: usize,
+    pub group_input: String,
+    pub group_input_cursor: usize,
+    pub status: String,
+    pub should_quit: bool,
+    pub animations: Animations,
+    pub recent_task_index: Option<usize>,
+    pub recent_task_motion: Option<TaskMotion>,
+}
+
+impl App {
+    pub fn new(project: Project, project_path: PathBuf) -> Self {
+        Self {
+            project,
+            project_path,
+            focus: Pane::Composer,
+            mode: Mode::Normal,
+            active_group: 0,
+            selected_group: 0,
+            selected_task: 0,
+            composer: String::new(),
+            composer_cursor: 0,
+            group_input: String::new(),
+            group_input_cursor: 0,
+            status: "Ready".into(),
+            should_quit: false,
+            animations: Animations::new(),
+            recent_task_index: None,
+            recent_task_motion: None,
+        }
+    }
+
+    pub fn tick(&mut self) {
+        self.animations.tick();
+    }
+
+    pub fn current_group_task_count(&self) -> usize {
+        self.project
+            .groups
+            .get(self.active_group)
+            .map(|group| group.tasks.len())
+            .unwrap_or(0)
+    }
+
+    pub fn on_key(&mut self, key: KeyEvent) -> Result<()> {
+        if key.kind != KeyEventKind::Press {
+            return Ok(());
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return Ok(());
+        }
+
+        if self.mode == Mode::CreatingGroup {
+            return self.handle_group_creation_key(key);
+        }
+        if self.mode == Mode::ConfirmClearClosed {
+            return self.handle_clear_closed_confirmation_key(key);
+        }
+
+        match key.code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('1') => self.set_focus(Pane::Groups),
+            KeyCode::Char('2') => self.set_focus(Pane::Composer),
+            KeyCode::Char('3') => self.set_focus(Pane::Tasks),
+            KeyCode::Up => self.navigate_up(),
+            KeyCode::Down => self.navigate_down(),
+            KeyCode::Left => self.navigate_left(),
+            KeyCode::Right => self.navigate_right(),
+            KeyCode::Esc => self.clear_status("Cancelled"),
+            _ => self.handle_focused_key(key)?,
+        }
+
+        Ok(())
+    }
+
+    fn handle_focused_key(&mut self, key: KeyEvent) -> Result<()> {
+        match self.focus {
+            Pane::Composer => self.handle_composer_key(key)?,
+            Pane::Groups => self.handle_groups_key(key)?,
+            Pane::Tasks => self.handle_tasks_key(key)?,
+        }
+        Ok(())
+    }
+
+    fn handle_composer_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Enter => self.submit_task()?,
+            KeyCode::Backspace => {
+                self.remove_composer_left();
+            }
+            KeyCode::Delete => {
+                self.remove_composer_right();
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.insert_composer_char(ch);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_groups_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Enter => {
+                self.active_group = self.selected_group;
+                self.selected_task = 0;
+                self.animations.pulse_group();
+                self.set_status(format!(
+                    "Group: {}",
+                    self.project.groups[self.active_group].name
+                ));
+            }
+            KeyCode::Char('n') => {
+                self.mode = Mode::CreatingGroup;
+                self.group_input.clear();
+                self.group_input_cursor = 0;
+                self.animations.note_cursor_activity();
+                self.set_status("Name the new group");
+                self.animations.pulse_focus();
+            }
+            KeyCode::Char('d') => {
+                if self.active_group_closed_task_count() == 0 {
+                    self.invalid("No closed tasks to clear");
+                } else {
+                    self.mode = Mode::ConfirmClearClosed;
+                    self.set_status("Clear closed tasks? y/n");
+                    self.animations.pulse_focus();
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_tasks_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Enter => self.toggle_task_status()?,
+            KeyCode::Char('x') => self.close_task()?,
+            KeyCode::Char('o') | KeyCode::Char('r') => self.reopen_task()?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_group_creation_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.group_input.clear();
+                self.group_input_cursor = 0;
+                self.clear_status("Cancelled new group");
+            }
+            KeyCode::Enter => self.commit_new_group()?,
+            KeyCode::Backspace => {
+                self.remove_group_input_left();
+            }
+            KeyCode::Delete => {
+                self.remove_group_input_right();
+            }
+            KeyCode::Left => {
+                self.group_input_cursor = prev_boundary(&self.group_input, self.group_input_cursor);
+                self.animations.note_cursor_activity();
+            }
+            KeyCode::Right => {
+                self.group_input_cursor = next_boundary(&self.group_input, self.group_input_cursor);
+                self.animations.note_cursor_activity();
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.insert_group_input_char(ch);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_clear_closed_confirmation_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => self.clear_closed_tasks()?,
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.clear_status("Cancelled clear closed tasks");
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn submit_task(&mut self) -> Result<()> {
+        let text = self.composer.trim();
+        if text.is_empty() {
+            self.invalid("Task cannot be empty");
+            return Ok(());
+        }
+
+        self.project.add_task(self.active_group, text.to_string());
+        self.composer.clear();
+        self.composer_cursor = 0;
+        self.animations.note_cursor_activity();
+        self.selected_task = 0;
+        self.recent_task_index = Some(0);
+        self.recent_task_motion = Some(TaskMotion::Added);
+        self.animations.pulse_task();
+        self.set_status("Task captured");
+        self.persist()
+    }
+
+    fn commit_new_group(&mut self) -> Result<()> {
+        let name = self.group_input.trim();
+        if name.is_empty() {
+            self.invalid("Group name cannot be empty");
+            return Ok(());
+        }
+
+        let index = self.project.add_group(name.to_string());
+        self.mode = Mode::Normal;
+        self.group_input.clear();
+        self.group_input_cursor = 0;
+        self.active_group = index;
+        self.selected_group = index;
+        self.selected_task = 0;
+        self.animations.pulse_group();
+        self.set_status("Group created");
+        self.animations.pulse_task();
+        self.persist()
+    }
+
+    fn clear_closed_tasks(&mut self) -> Result<()> {
+        let Some(group) = self.project.groups.get_mut(self.active_group) else {
+            self.invalid("No active group");
+            return Ok(());
+        };
+
+        let before = group.tasks.len();
+        group.tasks.retain(|task| task.status != TaskStatus::Closed);
+        let removed = before.saturating_sub(group.tasks.len());
+        self.mode = Mode::Normal;
+        self.selected_task = self.selected_task.min(group.tasks.len().saturating_sub(1));
+
+        if removed == 0 {
+            self.invalid("No closed tasks to clear");
+            return Ok(());
+        }
+
+        self.recent_task_index = None;
+        self.recent_task_motion = None;
+        self.set_status(format!("Cleared {removed} closed task(s)"));
+        self.animations.pulse_task();
+        self.persist()
+    }
+
+    fn close_task(&mut self) -> Result<()> {
+        let Some(group) = self.project.groups.get_mut(self.active_group) else {
+            self.invalid("No active group");
+            return Ok(());
+        };
+
+        let Some(task) = group.tasks.get_mut(self.selected_task) else {
+            self.invalid("No task selected");
+            return Ok(());
+        };
+
+        if task.status == TaskStatus::Closed {
+            self.invalid("Task already closed");
+            return Ok(());
+        }
+
+        task.close();
+        self.recent_task_index = Some(self.selected_task);
+        self.recent_task_motion = Some(TaskMotion::Closed);
+        self.set_status("Task closed");
+        self.animations.pulse_task();
+        self.persist()
+    }
+
+    fn reopen_task(&mut self) -> Result<()> {
+        let Some(group) = self.project.groups.get_mut(self.active_group) else {
+            self.invalid("No active group");
+            return Ok(());
+        };
+
+        let Some(task) = group.tasks.get_mut(self.selected_task) else {
+            self.invalid("No task selected");
+            return Ok(());
+        };
+
+        if task.status == TaskStatus::Open {
+            self.invalid("Task already open");
+            return Ok(());
+        }
+
+        task.reopen();
+        self.recent_task_index = Some(self.selected_task);
+        self.recent_task_motion = Some(TaskMotion::Reopened);
+        self.set_status("Task reopened");
+        self.animations.pulse_task();
+        self.persist()
+    }
+
+    fn navigate_up(&mut self) {
+        match self.focus {
+            Pane::Groups => {}
+            Pane::Composer => {
+                self.focus = Pane::Groups;
+                self.animations.pulse_focus();
+            }
+            Pane::Tasks => {
+                if self.selected_task > 0 {
+                    self.selected_task -= 1;
+                } else {
+                    self.focus = Pane::Composer;
+                    self.animations.pulse_focus();
+                }
+            }
+        }
+    }
+
+    fn navigate_down(&mut self) {
+        match self.focus {
+            Pane::Groups => {
+                self.focus = Pane::Composer;
+                self.animations.pulse_focus();
+            }
+            Pane::Composer => {
+                self.focus = Pane::Tasks;
+                self.animations.pulse_focus();
+            }
+            Pane::Tasks => {
+                let count = self.current_group_task_count();
+                if count == 0 {
+                    return;
+                }
+                let last = count.saturating_sub(1);
+                self.selected_task = (self.selected_task + 1).min(last);
+            }
+        }
+    }
+
+    fn navigate_left(&mut self) {
+        match self.focus {
+            Pane::Groups => {
+                self.selected_group = self.selected_group.saturating_sub(1);
+            }
+            Pane::Composer => {
+                self.composer_cursor = prev_boundary(&self.composer, self.composer_cursor);
+                self.animations.note_cursor_activity();
+            }
+            Pane::Tasks => {
+                self.focus = Pane::Composer;
+                self.animations.note_cursor_activity();
+                self.animations.pulse_focus();
+            }
+        }
+    }
+
+    fn navigate_right(&mut self) {
+        match self.focus {
+            Pane::Groups => {
+                let last = self.project.groups.len().saturating_sub(1);
+                self.selected_group = (self.selected_group + 1).min(last);
+            }
+            Pane::Composer => {
+                self.composer_cursor = next_boundary(&self.composer, self.composer_cursor);
+                self.animations.note_cursor_activity();
+            }
+            Pane::Tasks => {}
+        }
+    }
+
+    fn toggle_task_status(&mut self) -> Result<()> {
+        let Some(group) = self.project.groups.get(self.active_group) else {
+            self.invalid("No active group");
+            return Ok(());
+        };
+        let Some(task) = group.tasks.get(self.selected_task) else {
+            self.invalid("No task selected");
+            return Ok(());
+        };
+        if task.status == TaskStatus::Open {
+            self.close_task()
+        } else {
+            self.reopen_task()
+        }
+    }
+
+    fn persist(&mut self) -> Result<()> {
+        storage::save_project(&self.project_path, &self.project)?;
+        self.animations.pulse_status();
+        Ok(())
+    }
+
+    fn invalid(&mut self, status: impl Into<String>) {
+        self.status = status.into();
+        self.animations.shake();
+        self.animations.pulse_status();
+    }
+
+    fn set_status(&mut self, status: impl Into<String>) {
+        self.status = status.into();
+        self.animations.pulse_status();
+    }
+
+    fn clear_status(&mut self, status: impl Into<String>) {
+        self.status = status.into();
+        self.animations.pulse_status();
+    }
+
+    pub fn tick_rate() -> Duration {
+        Duration::from_millis(33)
+    }
+
+    fn active_group_closed_task_count(&self) -> usize {
+        self.project
+            .groups
+            .get(self.active_group)
+            .map(|group| {
+                group
+                    .tasks
+                    .iter()
+                    .filter(|task| task.status == TaskStatus::Closed)
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    fn set_focus(&mut self, pane: Pane) {
+        self.focus = pane;
+        if pane == Pane::Composer {
+            self.animations.note_cursor_activity();
+        }
+        self.animations.pulse_focus();
+    }
+
+    fn insert_composer_char(&mut self, ch: char) {
+        self.composer.insert(self.composer_cursor, ch);
+        self.composer_cursor += ch.len_utf8();
+        self.animations.note_cursor_activity();
+    }
+
+    fn remove_composer_left(&mut self) {
+        if self.composer_cursor == 0 {
+            return;
+        }
+        let remove_at = prev_boundary(&self.composer, self.composer_cursor);
+        self.composer.drain(remove_at..self.composer_cursor);
+        self.composer_cursor = remove_at;
+        self.animations.note_cursor_activity();
+    }
+
+    fn remove_composer_right(&mut self) {
+        if self.composer_cursor >= self.composer.len() {
+            return;
+        }
+        let next = next_boundary(&self.composer, self.composer_cursor);
+        self.composer.drain(self.composer_cursor..next);
+        self.animations.note_cursor_activity();
+    }
+
+    fn insert_group_input_char(&mut self, ch: char) {
+        self.group_input.insert(self.group_input_cursor, ch);
+        self.group_input_cursor += ch.len_utf8();
+        self.animations.note_cursor_activity();
+    }
+
+    fn remove_group_input_left(&mut self) {
+        if self.group_input_cursor == 0 {
+            return;
+        }
+        let remove_at = prev_boundary(&self.group_input, self.group_input_cursor);
+        self.group_input.drain(remove_at..self.group_input_cursor);
+        self.group_input_cursor = remove_at;
+        self.animations.note_cursor_activity();
+    }
+
+    fn remove_group_input_right(&mut self) {
+        if self.group_input_cursor >= self.group_input.len() {
+            return;
+        }
+        let next = next_boundary(&self.group_input, self.group_input_cursor);
+        self.group_input.drain(self.group_input_cursor..next);
+        self.animations.note_cursor_activity();
+    }
+}
+
+fn prev_boundary(text: &str, cursor: usize) -> usize {
+    text[..cursor]
+        .char_indices()
+        .last()
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+fn next_boundary(text: &str, cursor: usize) -> usize {
+    if cursor >= text.len() {
+        return text.len();
+    }
+    text[cursor..]
+        .char_indices()
+        .nth(1)
+        .map(|(index, _)| cursor + index)
+        .unwrap_or(text.len())
+}
