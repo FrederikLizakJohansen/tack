@@ -11,7 +11,7 @@ use std::{io, path::PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
-    event::DisableMouseCapture,
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -49,7 +49,8 @@ fn canonicalize_project_path(path: PathBuf) -> Result<PathBuf> {
 fn run_tui(mut app: App) -> Result<()> {
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
+        .context("failed to enter alternate screen")?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
@@ -60,6 +61,7 @@ fn run_tui(mut app: App) -> Result<()> {
     disable_raw_mode().ok();
     execute!(
         terminal.backend_mut(),
+        DisableBracketedPaste,
         LeaveAlternateScreen,
         DisableMouseCapture
     )
@@ -80,9 +82,7 @@ fn run_event_loop(
         }
 
         if let Some(event) = input::next_event(App::tick_rate())? {
-            if let Some(key) = input::as_key(event) {
-                app.on_key(key)?;
-            }
+            app.on_event(event)?;
         }
         app.tick();
     }

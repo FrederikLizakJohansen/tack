@@ -15,14 +15,16 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::default().bg(Color::Rgb(12, 14, 18))), area);
 
+    let groups_height = if area.height < 24 { 4 } else { 5 };
+    let composer_height = if area.height < 24 { 9 } else { 11 };
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),
+            Constraint::Length(groups_height),
             Constraint::Length(1),
-            Constraint::Length(11),
+            Constraint::Length(composer_height),
             Constraint::Length(1),
-            Constraint::Min(10),
+            Constraint::Min(6),
             Constraint::Length(2),
         ])
         .margin(1)
@@ -33,11 +35,16 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     draw_tasks(frame, layout[4], app);
     draw_footer(frame, layout[5], app);
 
-    if app.mode == Mode::CreatingGroup {
-        draw_group_modal(frame, centered_rect(42, 7, area), app);
-    }
-    if app.mode == Mode::ConfirmClearClosed {
-        draw_clear_closed_modal(frame, centered_rect(48, 8, area), app);
+    match app.mode {
+        Mode::CreatingGroup => draw_group_modal(frame, centered_rect(42, 7, area), app),
+        Mode::RenamingGroup => draw_rename_group_modal(frame, centered_rect(42, 7, area), app),
+        Mode::ConfirmClearClosed => {
+            draw_clear_closed_modal(frame, centered_rect(48, 8, area), app)
+        }
+        Mode::ConfirmDeleteGroup => {
+            draw_delete_group_modal(frame, centered_rect(48, 8, area), app)
+        }
+        Mode::Normal | Mode::EditingCapture | Mode::EditingTask => {}
     }
 }
 
@@ -46,20 +53,14 @@ fn draw_groups(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let title = Line::styled(
-        "Project lanes",
-        Style::default()
-            .fg(Color::Rgb(236, 239, 245))
-            .add_modifier(Modifier::BOLD),
-    );
     let hint = Line::styled(
-        "Left/Right select a box, Enter activates, d clears closed",
+        "Left/Right select, Enter activate, n new, r rename, x delete, d clear closed",
         Style::default().fg(Color::Rgb(112, 125, 148)),
     );
 
     let row_area = Rect {
         x: inner.x,
-        y: inner.y + 2,
+        y: inner.y + 1,
         width: inner.width,
         height: 1,
     };
@@ -100,7 +101,7 @@ fn draw_groups(frame: &mut Frame<'_>, area: Rect, app: &App) {
         spans.push(Span::styled(format!(" {} ", group.name), style));
         spans.push(Span::raw(" "));
     }
-    spans.push(Span::raw("  "));
+    spans.push(Span::raw(" "));
     spans.push(Span::styled(
         "+ n",
         Style::default()
@@ -109,7 +110,7 @@ fn draw_groups(frame: &mut Frame<'_>, area: Rect, app: &App) {
     ));
 
     frame.render_widget(
-        Paragraph::new(Text::from(vec![title, Line::default(), Line::default(), Line::default(), hint]))
+        Paragraph::new(Text::from(vec![Line::default(), Line::default(), hint]))
             .wrap(Wrap { trim: false }),
         inner,
     );
@@ -145,65 +146,67 @@ fn draw_groups(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let card_width = area.width.saturating_sub(8).clamp(52, 104);
-    let card_height = area.height.min(9);
+    let available_width = area.width.saturating_sub(4);
+    let card_width = if available_width < 34 {
+        available_width
+    } else {
+        available_width.min(104)
+    };
+    let card_height = area.height.min(9).max(5);
     let composer_area = centered_rect(card_width, card_height, area);
     let shifted = shift_rect(
         composer_area,
         app.animations.shake.as_ref().map(|s| s.offset()).unwrap_or(0),
     );
-    let block = pane_block("Capture", app.focus == Pane::Composer, app);
+    let header = format!(
+        " {} | Active: {}{} ",
+        match app.mode {
+            Mode::EditingTask => "Edit Task",
+            _ => "Capture",
+        },
+        app.project.groups[app.active_group].name,
+        match app.mode {
+            Mode::EditingCapture => " | typing",
+            Mode::EditingTask => " | editing",
+            _ => "",
+        },
+    );
+    let block = pane_block(&header, app.focus == Pane::Composer, app);
     let inner = block.inner(shifted).inner(Margin {
         horizontal: 2,
         vertical: 1,
     });
     frame.render_widget(block, shifted);
 
-    let title_bar = Line::from(vec![
-        Span::styled(
-            "Quick capture",
-            Style::default()
-                .fg(Color::Rgb(240, 241, 245))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("   "),
-        Span::styled(
-            format!("Active: {}", app.project.groups[app.active_group].name),
-            Style::default().fg(Color::Rgb(255, 214, 102)),
-        ),
-    ]);
-
-    let ghost = if app.composer.is_empty() {
-        Line::styled(
-            "Type a task and press Enter.",
+    let hint = match app.mode {
+        Mode::EditingCapture => Line::styled(
+            "Enter saves the capture. Esc cancels it.",
             Style::default().fg(Color::Rgb(108, 122, 145)),
-        )
-    } else {
-        Line::styled(
-            "Enter captures into the active group.",
+        ),
+        Mode::EditingTask => Line::styled(
+            "Enter saves the task edit. Esc cancels it.",
             Style::default().fg(Color::Rgb(108, 122, 145)),
-        )
+        ),
+        _ => Line::styled(
+            "Press Enter to start a new capture.",
+            Style::default().fg(Color::Rgb(108, 122, 145)),
+        ),
     };
 
-    let editor_height = inner.height.saturating_sub(4) as usize;
-    let mut lines = vec![
-        title_bar,
-        Line::default(),
-    ];
-    lines.extend(editor_lines(
+    let editor_height = inner.height.saturating_sub(2) as usize;
+    let mut lines = editor_lines(
         &app.composer,
         app.composer_cursor,
         inner.width as usize,
         editor_height.max(1),
-        app.focus == Pane::Composer,
+        matches!(app.mode, Mode::EditingCapture | Mode::EditingTask),
         app,
-    ));
+    );
     lines.push(Line::default());
-    lines.push(ghost);
-    let text = Text::from(lines);
+    lines.push(hint);
 
     frame.render_widget(
-        Paragraph::new(text)
+        Paragraph::new(Text::from(lines))
             .alignment(Alignment::Left)
             .wrap(Wrap { trim: false }),
         inner,
@@ -275,7 +278,7 @@ fn draw_tasks(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let content = if rows.is_empty() {
         Text::from(Line::styled(
-            "No tasks yet. Use the center pane to capture one.",
+            "No tasks yet. Use the capture pane to create one.",
             Style::default().fg(Color::Rgb(108, 122, 145)),
         ))
     } else {
@@ -299,8 +302,7 @@ fn draw_tasks(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Paragraph::new(Line::styled(
                 if show_up { "↑" } else { " " },
                 Style::default().fg(Color::Rgb(112, 125, 148)),
-            ))
-            .alignment(Alignment::Right),
+            )),
             Rect {
                 x: inner.x + inner.width.saturating_sub(2),
                 y: inner.y,
@@ -312,8 +314,7 @@ fn draw_tasks(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Paragraph::new(Line::styled(
                 if show_down { "↓" } else { " " },
                 Style::default().fg(Color::Rgb(112, 125, 148)),
-            ))
-            .alignment(Alignment::Right),
+            )),
             Rect {
                 x: inner.x + inner.width.saturating_sub(2),
                 y: inner.y + inner.height.saturating_sub(1),
@@ -335,15 +336,13 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled("Arrows", Style::default().fg(Color::Rgb(255, 214, 102))),
         Span::raw(" move/focus  "),
         Span::styled("Enter", Style::default().fg(Color::Rgb(255, 214, 102))),
-        Span::raw(" submit/toggle close  "),
+        Span::raw(" start/save/toggle  "),
         Span::styled("1/2/3", Style::default().fg(Color::Rgb(255, 214, 102))),
         Span::raw(" jump panes  "),
-        Span::styled("n", Style::default().fg(Color::Rgb(255, 214, 102))),
-        Span::raw(" new group  "),
-        Span::styled("d", Style::default().fg(Color::Rgb(255, 214, 102))),
-        Span::raw(" clear closed  "),
-        Span::styled("x/o", Style::default().fg(Color::Rgb(255, 214, 102))),
-        Span::raw(" close/reopen  "),
+        Span::styled("n/r/x/d", Style::default().fg(Color::Rgb(255, 214, 102))),
+        Span::raw(" group actions  "),
+        Span::styled("e/c/x/o", Style::default().fg(Color::Rgb(255, 214, 102))),
+        Span::raw(" edit/copy/close/reopen  "),
         Span::styled("q", Style::default().fg(Color::Rgb(255, 214, 102))),
         Span::raw(" quit  "),
         Span::styled(
@@ -372,7 +371,34 @@ fn draw_group_modal(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Paragraph::new(Text::from(vec![
             Line::styled(
                 "Name the group and press Enter",
-            Style::default().fg(Color::Rgb(210, 214, 224)),
+                Style::default().fg(Color::Rgb(210, 214, 224)),
+            ),
+            Line::default(),
+            input_line(&app.group_input, app.group_input_cursor, inner.width as usize, true, app),
+        ]))
+        .alignment(Alignment::Left),
+        inner,
+    );
+}
+
+fn draw_rename_group_modal(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Rename Group ")
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(Color::Rgb(255, 214, 102))
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().bg(Color::Rgb(18, 20, 26)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::styled(
+                "Edit the group name and press Enter",
+                Style::default().fg(Color::Rgb(210, 214, 224)),
             ),
             Line::default(),
             input_line(&app.group_input, app.group_input_cursor, inner.width as usize, true, app),
@@ -433,6 +459,51 @@ fn draw_clear_closed_modal(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
+fn draw_delete_group_modal(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Delete Group ")
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(Color::Rgb(255, 120, 120))
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().bg(Color::Rgb(18, 20, 26)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let group_name = app
+        .project
+        .groups
+        .get(app.selected_group)
+        .map(|group| group.name.as_str())
+        .unwrap_or("this group");
+
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::styled(
+                format!("Delete group \"{group_name}\" and all its tasks?"),
+                Style::default()
+                    .fg(Color::Rgb(236, 239, 245))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::default(),
+            Line::styled(
+                "This cannot be undone from inside the app.",
+                Style::default().fg(Color::Rgb(255, 120, 120)),
+            ),
+            Line::default(),
+            Line::styled(
+                "Press y to confirm or Esc/n to cancel.",
+                Style::default().fg(Color::Rgb(140, 152, 172)),
+            ),
+        ]))
+        .alignment(Alignment::Left),
+        inner,
+    );
+}
+
 fn pane_block(title: &str, focused: bool, app: &App) -> Block<'static> {
     let mut color = Color::Rgb(72, 86, 108);
     if focused {
@@ -443,7 +514,7 @@ fn pane_block(title: &str, focused: bool, app: &App) -> Block<'static> {
     }
 
     Block::default()
-        .title(format!(" {title} "))
+        .title(title.to_string())
         .borders(Borders::ALL)
         .border_style(Style::default().fg(color))
         .style(Style::default().bg(Color::Rgb(18, 20, 26)))
@@ -463,17 +534,13 @@ fn input_line(
     let scroll_chars = cursor_char_index.saturating_sub(available_text_width.saturating_sub(1));
     let end_chars = (scroll_chars + available_text_width).min(total_chars);
     let visible_text = slice_chars(text, scroll_chars, end_chars);
-    let cursor_in_view = cursor_char_index.saturating_sub(scroll_chars);
     let visible_chars: Vec<char> = visible_text.chars().collect();
+    let cursor_in_view = cursor_char_index.saturating_sub(scroll_chars).min(visible_chars.len());
     let left: String = visible_chars.iter().take(cursor_in_view).collect();
-    let right: String = visible_chars.iter().skip(cursor_in_view).collect();
-    let cursor_glyph = if show_cursor && app.animations.cursor_visible() {
-        "█"
-    } else {
-        " "
-    };
     let show_left = scroll_chars > 0;
     let show_right = end_chars < total_chars;
+    let cursor_on_char = cursor_in_view < visible_chars.len();
+    let current_char = visible_chars.get(cursor_in_view).copied().unwrap_or(' ');
 
     let mut spans = vec![
         Span::styled(
@@ -482,25 +549,53 @@ fn input_line(
         ),
         Span::styled("> ", Style::default().fg(Color::Rgb(255, 214, 102))),
         Span::styled(left, Style::default().fg(Color::Rgb(245, 247, 250))),
-        Span::styled(
-            cursor_glyph,
+    ];
+
+    if cursor_on_char {
+        spans.push(Span::styled(
+            current_char.to_string(),
+            if show_cursor && app.animations.cursor_visible() {
+                Style::default()
+                    .fg(Color::Rgb(18, 20, 26))
+                    .bg(Color::Rgb(255, 214, 102))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Rgb(245, 247, 250))
+            },
+        ));
+        let trailing: String = visible_chars.iter().skip(cursor_in_view + 1).collect();
+        spans.push(Span::styled(
+            trailing,
+            Style::default().fg(Color::Rgb(245, 247, 250)),
+        ));
+    } else {
+        spans.push(Span::styled(
+            if show_cursor && app.animations.cursor_visible() {
+                "█"
+            } else {
+                " "
+            },
             Style::default()
                 .fg(Color::Rgb(255, 214, 102))
                 .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(right, Style::default().fg(Color::Rgb(245, 247, 250))),
-        Span::styled(
-            if show_right { " →" } else { "  " },
-            Style::default().fg(Color::Rgb(112, 125, 148)),
-        ),
-    ];
+        ));
+    }
+
+    spans.push(Span::styled(
+        if show_right { " →" } else { "  " },
+        Style::default().fg(Color::Rgb(112, 125, 148)),
+    ));
 
     if text.is_empty() {
         spans = vec![
             Span::raw("  "),
             Span::styled("> ", Style::default().fg(Color::Rgb(255, 214, 102))),
             Span::styled(
-                cursor_glyph,
+                if show_cursor && app.animations.cursor_visible() {
+                    "█"
+                } else {
+                    " "
+                },
                 Style::default()
                     .fg(Color::Rgb(255, 214, 102))
                     .add_modifier(Modifier::BOLD),
@@ -548,7 +643,8 @@ fn editor_lines(
         let visible_chars: Vec<char> = visible.chars().collect();
         let cursor_in_view = cursor_col.saturating_sub(scroll_left).min(visible_chars.len());
         let left: String = visible_chars.iter().take(cursor_in_view).collect();
-        let right: String = visible_chars.iter().skip(cursor_in_view).collect();
+        let cursor_on_char = cursor_in_view < visible_chars.len();
+        let current_char = visible_chars.get(cursor_in_view).copied().unwrap_or(' ');
 
         let mut spans = vec![
             Span::styled(
@@ -560,19 +656,42 @@ fn editor_lines(
         ];
 
         if current {
+            if cursor_on_char {
+                spans.push(Span::styled(
+                    current_char.to_string(),
+                    if show_cursor && app.animations.cursor_visible() {
+                        Style::default()
+                            .fg(Color::Rgb(18, 20, 26))
+                            .bg(Color::Rgb(255, 214, 102))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(245, 247, 250))
+                    },
+                ));
+                let trailing: String = visible_chars.iter().skip(cursor_in_view + 1).collect();
+                spans.push(Span::styled(
+                    trailing,
+                    Style::default().fg(Color::Rgb(245, 247, 250)),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    if show_cursor && app.animations.cursor_visible() {
+                        "█"
+                    } else {
+                        " "
+                    },
+                    Style::default()
+                        .fg(Color::Rgb(255, 214, 102))
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+        } else {
             spans.push(Span::styled(
-                if show_cursor && app.animations.cursor_visible() {
-                    "█"
-                } else {
-                    " "
-                },
-                Style::default()
-                    .fg(Color::Rgb(255, 214, 102))
-                    .add_modifier(Modifier::BOLD),
+                visible_chars.iter().skip(cursor_in_view).collect::<String>(),
+                Style::default().fg(Color::Rgb(245, 247, 250)),
             ));
         }
 
-        spans.push(Span::styled(right, Style::default().fg(Color::Rgb(245, 247, 250))));
         rendered.push(Line::from(spans));
     }
 

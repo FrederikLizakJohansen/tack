@@ -1,7 +1,8 @@
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use arboard::Clipboard;
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::{
     anim::Animations,
@@ -19,8 +20,12 @@ pub enum Pane {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
+    EditingCapture,
+    EditingTask,
     CreatingGroup,
+    RenamingGroup,
     ConfirmClearClosed,
+    ConfirmDeleteGroup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +88,14 @@ impl App {
             .unwrap_or(0)
     }
 
+    pub fn on_event(&mut self, event: Event) -> Result<()> {
+        match event {
+            Event::Key(key) => self.on_key(key),
+            Event::Paste(text) => self.on_paste(text),
+            _ => Ok(()),
+        }
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) -> Result<()> {
         if key.kind != KeyEventKind::Press {
             return Ok(());
@@ -93,15 +106,19 @@ impl App {
             return Ok(());
         }
 
-        if self.mode == Mode::CreatingGroup {
-            return self.handle_group_creation_key(key);
-        }
-        if self.mode == Mode::ConfirmClearClosed {
-            return self.handle_clear_closed_confirmation_key(key);
+        match self.mode {
+            Mode::EditingCapture => return self.handle_capture_edit_key(key),
+            Mode::EditingTask => return self.handle_task_edit_key(key),
+            Mode::CreatingGroup => return self.handle_group_creation_key(key),
+            Mode::RenamingGroup => return self.handle_group_rename_key(key),
+            Mode::ConfirmClearClosed => return self.handle_clear_closed_confirmation_key(key),
+            Mode::ConfirmDeleteGroup => return self.handle_delete_group_confirmation_key(key),
+            Mode::Normal => {}
         }
 
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('d') => self.begin_clear_closed(),
             KeyCode::Char('1') => self.set_focus(Pane::Groups),
             KeyCode::Char('2') => self.set_focus(Pane::Composer),
             KeyCode::Char('3') => self.set_focus(Pane::Tasks),
@@ -127,16 +144,7 @@ impl App {
 
     fn handle_composer_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
-            KeyCode::Enter => self.submit_task()?,
-            KeyCode::Backspace => {
-                self.remove_composer_left();
-            }
-            KeyCode::Delete => {
-                self.remove_composer_right();
-            }
-            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.insert_composer_char(ch);
-            }
+            KeyCode::Enter => self.begin_capture_edit(),
             _ => {}
         }
         Ok(())
@@ -154,21 +162,13 @@ impl App {
                 ));
             }
             KeyCode::Char('n') => {
-                self.mode = Mode::CreatingGroup;
-                self.group_input.clear();
-                self.group_input_cursor = 0;
-                self.animations.note_cursor_activity();
-                self.set_status("Name the new group");
-                self.animations.pulse_focus();
+                self.begin_new_group();
             }
-            KeyCode::Char('d') => {
-                if self.active_group_closed_task_count() == 0 {
-                    self.invalid("No closed tasks to clear");
-                } else {
-                    self.mode = Mode::ConfirmClearClosed;
-                    self.set_status("Clear closed tasks? y/n");
-                    self.animations.pulse_focus();
-                }
+            KeyCode::Char('r') => {
+                self.begin_rename_group();
+            }
+            KeyCode::Char('x') => {
+                self.begin_delete_group();
             }
             _ => {}
         }
@@ -178,8 +178,64 @@ impl App {
     fn handle_tasks_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Enter => self.toggle_task_status()?,
+            KeyCode::Char('c') => self.copy_selected_task()?,
+            KeyCode::Char('e') => self.begin_task_edit()?,
             KeyCode::Char('x') => self.close_task()?,
             KeyCode::Char('o') | KeyCode::Char('r') => self.reopen_task()?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_capture_edit_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Enter => self.submit_task()?,
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.composer.clear();
+                self.composer_cursor = 0;
+                self.clear_status("Cancelled capture");
+            }
+            KeyCode::Backspace => self.remove_composer_left(),
+            KeyCode::Delete => self.remove_composer_right(),
+            KeyCode::Left => {
+                self.composer_cursor = prev_boundary(&self.composer, self.composer_cursor);
+                self.animations.note_cursor_activity();
+            }
+            KeyCode::Right => {
+                self.composer_cursor = next_boundary(&self.composer, self.composer_cursor);
+                self.animations.note_cursor_activity();
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.insert_composer_char(ch);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_task_edit_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Enter => self.commit_task_edit()?,
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.composer.clear();
+                self.composer_cursor = 0;
+                self.clear_status("Cancelled task edit");
+            }
+            KeyCode::Backspace => self.remove_composer_left(),
+            KeyCode::Delete => self.remove_composer_right(),
+            KeyCode::Left => {
+                self.composer_cursor = prev_boundary(&self.composer, self.composer_cursor);
+                self.animations.note_cursor_activity();
+            }
+            KeyCode::Right => {
+                self.composer_cursor = next_boundary(&self.composer, self.composer_cursor);
+                self.animations.note_cursor_activity();
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.insert_composer_char(ch);
+            }
             _ => {}
         }
         Ok(())
@@ -216,12 +272,51 @@ impl App {
         Ok(())
     }
 
+    fn handle_group_rename_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.group_input.clear();
+                self.group_input_cursor = 0;
+                self.clear_status("Cancelled rename");
+            }
+            KeyCode::Enter => self.commit_group_rename()?,
+            KeyCode::Backspace => self.remove_group_input_left(),
+            KeyCode::Delete => self.remove_group_input_right(),
+            KeyCode::Left => {
+                self.group_input_cursor = prev_boundary(&self.group_input, self.group_input_cursor);
+                self.animations.note_cursor_activity();
+            }
+            KeyCode::Right => {
+                self.group_input_cursor = next_boundary(&self.group_input, self.group_input_cursor);
+                self.animations.note_cursor_activity();
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.insert_group_input_char(ch);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn handle_clear_closed_confirmation_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => self.clear_closed_tasks()?,
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 self.clear_status("Cancelled clear closed tasks");
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_delete_group_confirmation_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => self.delete_group()?,
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.clear_status("Cancelled delete group");
             }
             _ => {}
         }
@@ -238,6 +333,7 @@ impl App {
         self.project.add_task(self.active_group, text.to_string());
         self.composer.clear();
         self.composer_cursor = 0;
+        self.mode = Mode::Normal;
         self.animations.note_cursor_activity();
         self.selected_task = 0;
         self.recent_task_index = Some(0);
@@ -245,6 +341,35 @@ impl App {
         self.animations.pulse_task();
         self.set_status("Task captured");
         self.persist()
+    }
+
+    fn begin_capture_edit(&mut self) {
+        self.mode = Mode::EditingCapture;
+        self.composer.clear();
+        self.composer_cursor = 0;
+        self.animations.note_cursor_activity();
+        self.set_status("Typing capture");
+        self.animations.pulse_focus();
+    }
+
+    fn begin_task_edit(&mut self) -> Result<()> {
+        let Some(group) = self.project.groups.get(self.active_group) else {
+            self.invalid("No active group");
+            return Ok(());
+        };
+        let Some(task) = group.tasks.get(self.selected_task) else {
+            self.invalid("No task selected");
+            return Ok(());
+        };
+
+        self.mode = Mode::EditingTask;
+        self.focus = Pane::Composer;
+        self.composer = task.text.clone();
+        self.composer_cursor = self.composer.len();
+        self.animations.note_cursor_activity();
+        self.set_status("Editing task");
+        self.animations.pulse_focus();
+        Ok(())
     }
 
     fn commit_new_group(&mut self) -> Result<()> {
@@ -264,6 +389,51 @@ impl App {
         self.animations.pulse_group();
         self.set_status("Group created");
         self.animations.pulse_task();
+        self.persist()
+    }
+
+    fn commit_task_edit(&mut self) -> Result<()> {
+        let text = self.composer.trim();
+        if text.is_empty() {
+            self.invalid("Task cannot be empty");
+            return Ok(());
+        }
+
+        let Some(group) = self.project.groups.get_mut(self.active_group) else {
+            self.invalid("No active group");
+            return Ok(());
+        };
+        let Some(task) = group.tasks.get_mut(self.selected_task) else {
+            self.invalid("No task selected");
+            return Ok(());
+        };
+
+        task.text = text.to_string();
+        self.mode = Mode::Normal;
+        self.composer.clear();
+        self.composer_cursor = 0;
+        self.recent_task_index = Some(self.selected_task);
+        self.recent_task_motion = None;
+        self.set_status("Task updated");
+        self.animations.pulse_task();
+        self.persist()
+    }
+
+    fn commit_group_rename(&mut self) -> Result<()> {
+        let name = self.group_input.trim();
+        if name.is_empty() {
+            self.invalid("Group name cannot be empty");
+            return Ok(());
+        }
+
+        if let Some(group) = self.project.groups.get_mut(self.selected_group) {
+            group.name = name.to_string();
+        }
+        self.mode = Mode::Normal;
+        self.group_input.clear();
+        self.group_input_cursor = 0;
+        self.animations.pulse_group();
+        self.set_status("Group renamed");
         self.persist()
     }
 
@@ -288,6 +458,25 @@ impl App {
         self.recent_task_motion = None;
         self.set_status(format!("Cleared {removed} closed task(s)"));
         self.animations.pulse_task();
+        self.persist()
+    }
+
+    fn delete_group(&mut self) -> Result<()> {
+        if self.project.groups.len() <= 1 {
+            self.invalid("Cannot delete the last group");
+            self.mode = Mode::Normal;
+            return Ok(());
+        }
+
+        let index = self.selected_group.min(self.project.groups.len().saturating_sub(1));
+        self.project.groups.remove(index);
+        let fallback = index.min(self.project.groups.len().saturating_sub(1));
+        self.selected_group = fallback;
+        self.active_group = fallback.min(self.project.groups.len().saturating_sub(1));
+        self.selected_task = 0;
+        self.mode = Mode::Normal;
+        self.set_status("Group deleted");
+        self.animations.pulse_group();
         self.persist()
     }
 
@@ -471,6 +660,102 @@ impl App {
             self.animations.note_cursor_activity();
         }
         self.animations.pulse_focus();
+    }
+
+    fn begin_new_group(&mut self) {
+        self.mode = Mode::CreatingGroup;
+        self.group_input.clear();
+        self.group_input_cursor = 0;
+        self.animations.note_cursor_activity();
+        self.set_status("Name the new group");
+        self.animations.pulse_focus();
+    }
+
+    fn begin_rename_group(&mut self) {
+        let current_name = self
+            .project
+            .groups
+            .get(self.selected_group)
+            .map(|group| group.name.clone())
+            .unwrap_or_default();
+        self.mode = Mode::RenamingGroup;
+        self.group_input = current_name;
+        self.group_input_cursor = self.group_input.len();
+        self.animations.note_cursor_activity();
+        self.set_status("Rename the group");
+        self.animations.pulse_focus();
+    }
+
+    fn begin_clear_closed(&mut self) {
+        if self.active_group_closed_task_count() == 0 {
+            self.invalid("No closed tasks to clear");
+        } else {
+            self.mode = Mode::ConfirmClearClosed;
+            self.set_status("Clear closed tasks? y/n");
+            self.animations.pulse_focus();
+        }
+    }
+
+    fn begin_delete_group(&mut self) {
+        if self.project.groups.len() <= 1 {
+            self.invalid("Cannot delete the last group");
+        } else {
+            self.mode = Mode::ConfirmDeleteGroup;
+            self.set_status("Delete group? y/n");
+            self.animations.pulse_focus();
+        }
+    }
+
+    fn copy_selected_task(&mut self) -> Result<()> {
+        let Some(group) = self.project.groups.get(self.active_group) else {
+            self.invalid("No active group");
+            return Ok(());
+        };
+        let Some(task) = group.tasks.get(self.selected_task) else {
+            self.invalid("No task selected");
+            return Ok(());
+        };
+
+        let mut clipboard = match Clipboard::new() {
+            Ok(clipboard) => clipboard,
+            Err(_) => {
+                self.invalid("Clipboard unavailable");
+                return Ok(());
+            }
+        };
+
+        match clipboard.set_text(task.text.clone()) {
+            Ok(()) => {
+                self.set_status("Task copied");
+                Ok(())
+            }
+            Err(_) => {
+                self.invalid("Failed to copy task");
+                Ok(())
+            }
+        }
+    }
+
+    fn on_paste(&mut self, text: String) -> Result<()> {
+        match self.mode {
+            Mode::EditingCapture => {
+                for ch in text.chars() {
+                    self.insert_composer_char(ch);
+                }
+            }
+            Mode::EditingTask => {
+                for ch in text.chars() {
+                    self.insert_composer_char(ch);
+                }
+            }
+            Mode::CreatingGroup | Mode::RenamingGroup => {
+                for ch in text.chars() {
+                    self.insert_group_input_char(ch);
+                }
+            }
+            Mode::Normal | Mode::ConfirmClearClosed | Mode::ConfirmDeleteGroup => {}
+        }
+        Ok(())
     }
 
     fn insert_composer_char(&mut self, ch: char) {

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyEvent};
+use crossterm::event::{self, Event};
 
 pub fn next_event(timeout: Duration) -> std::io::Result<Option<Event>> {
     if event::poll(timeout)? {
@@ -9,11 +9,3 @@ pub fn next_event(timeout: Duration) -> std::io::Result<Option<Event>> {
         Ok(None)
     }
 }
-
-pub fn as_key(event: Event) -> Option<KeyEvent> {
-    match event {
-        Event::Key(key) => Some(key),
-        _ => None,
-    }
-}
-
