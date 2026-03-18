@@ -4,7 +4,7 @@
 
 ## Features
 
-- `tck new <project-name>` creates `<project-name>.tck.json` and opens the TUI
+- `tck new <project-name>` creates `<project-name>.tck` and opens the TUI
 - `tck open <path>` loads an existing project file and opens the TUI
 - default `Inbox` group for new projects
 - group selection, creation, and renaming
@@ -26,7 +26,7 @@ cargo run -- new demo
 To reopen an existing project:
 
 ```bash
-cargo run -- open demo.tck.json
+cargo run -- open demo.tck
 ```
 
 ## Controls

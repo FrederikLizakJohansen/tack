@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use crate::model::Project;
 
 pub fn default_project_path(project_name: &str) -> PathBuf {
-    PathBuf::from(format!("{project_name}.tck.json"))
+    PathBuf::from(format!("{project_name}.tck"))
 }
 
 pub fn load_project(path: &Path) -> Result<Project> {

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "A tactile terminal task app for fast capture and triage"
 license = "MIT"
-repository = "https://github.com/FrederikLizakJohansen/tack"
+repository = "https://github.com/FrederikLizakJohansen/tck"
 
 [dependencies]
 anyhow = "1.0"
